@@ -6,6 +6,7 @@ from app.catalog.repository import CatalogRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.matchmaking.service import MatchmakingService
 
 
 class CatalogService:
@@ -30,7 +31,16 @@ class CatalogService:
         if not values:
             raise ValidationError("没有可更新的产品字段")
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).update_product(product["id"], values, to_storage(self.clock.now()))
+            catalog = CatalogRepository(connection)
+            updated = catalog.update_product(product["id"], values, to_storage(self.clock.now()))
+            # 产品暂停或停用：只撤销尚未生效的名额，已确认的名额不受影响
+            becomes_unavailable = values.get("regulatory_status") == "暂停" or values.get("active") is False
+            if becomes_unavailable:
+                reason = f"产品 {product['code']} " + ("被暂停" if values.get("regulatory_status") == "暂停" else "被停用")
+                MatchmakingService(connection, self.clock).release_pending_for_product(
+                    connection, int(product["id"]), reason, "catalog-maintainer", to_storage(self.clock.now()),
+                )
+            return updated
 
     def list_products(self, category: str | None, status: str | None, active_only: bool, limit: int) -> list[dict]:
         return self.repository.list_products(category=category, status=status, active_only=active_only, limit=limit)
@@ -51,7 +61,21 @@ class CatalogService:
         if not values:
             raise ValidationError("没有可更新的场地字段")
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).update_site(site["id"], values, to_storage(self.clock.now()))
+            catalog = CatalogRepository(connection)
+            now = to_storage(self.clock.now())
+            updated = catalog.update_site(site["id"], values, now)
+            # 场地能力/容量/开放状态变化：重新校验并只撤销不再适配或超出新容量的未决名额
+            affects_matching = {
+                "capabilities", "served_populations", "max_concurrent", "ethics_prepared_level",
+                "supported_risk_levels", "open_windows", "status",
+            }
+            swept: list[dict] = []
+            if affects_matching.intersection(values):
+                swept = MatchmakingService(connection, self.clock).sweep_pending_for_site(
+                    connection, int(site["id"]), "catalog-maintainer", now,
+                )
+            updated["auto_revoked_matchings"] = swept
+            return updated
 
     def list_sites(self, status: str | None, site_type: str | None, capability: str | None) -> list[dict]:
         return self.repository.list_sites(status=status, site_type=site_type, capability=capability)

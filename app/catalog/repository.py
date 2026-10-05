@@ -21,8 +21,8 @@ class CatalogRepository:
 
     def create_product(self, data: dict, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO health_products(code,name,organization,origin_country,category,intended_use,risk_level,regulatory_status,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
-            (data["code"], data["name"], data["organization"], data["origin_country"], data["category"], data["intended_use"], data["risk_level"], data["regulatory_status"], now, now),
+            "INSERT INTO health_products(code,name,organization,origin_country,category,intended_use,intended_populations_json,risk_level,regulatory_status,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",
+            (data["code"], data["name"], data["organization"], data["origin_country"], data["category"], data["intended_use"], json.dumps(sorted(set(data.get("intended_populations") or [])), ensure_ascii=False), data["risk_level"], data["regulatory_status"], now, now),
         )
         return self.product_by_id(int(cursor.lastrowid)) or {}
 
@@ -30,6 +30,8 @@ class CatalogRepository:
         values = {key: value for key, value in changes.items() if value is not None}
         if "active" in values:
             values["active"] = 1 if values["active"] else 0
+        if "intended_populations" in values:
+            values["intended_populations_json"] = json.dumps(sorted(set(values.pop("intended_populations") or [])), ensure_ascii=False)
         assignments = [f"{key}=?" for key in values]
         self.connection.execute(
             f"UPDATE health_products SET {','.join(assignments)},updated_at=? WHERE id=?",
@@ -67,8 +69,17 @@ class CatalogRepository:
 
     def create_site(self, data: dict, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO pilot_sites(code,name,site_type,region,capabilities_json,max_concurrent,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)",
-            (data["code"], data["name"], data["site_type"], data["region"], json.dumps(sorted(set(data["capabilities"])), ensure_ascii=False), data["max_concurrent"], now, now),
+            "INSERT INTO pilot_sites(code,name,site_type,region,capabilities_json,served_populations_json,max_concurrent,ethics_prepared_level,supported_risk_levels_json,open_windows_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?, 'active',?,?)",
+            (
+                data["code"], data["name"], data["site_type"], data["region"],
+                json.dumps(sorted(set(data["capabilities"])), ensure_ascii=False),
+                json.dumps(sorted(set(data.get("served_populations") or [])), ensure_ascii=False),
+                data["max_concurrent"],
+                data.get("ethics_prepared_level", "none"),
+                json.dumps(sorted(set(data.get("supported_risk_levels") or ["low", "medium", "high"])), ensure_ascii=False),
+                json.dumps(data.get("open_windows") or [], ensure_ascii=False, sort_keys=True),
+                now, now,
+            ),
         )
         return self.site_by_id(int(cursor.lastrowid)) or {}
 
@@ -76,6 +87,12 @@ class CatalogRepository:
         values = {key: value for key, value in changes.items() if value is not None}
         if "capabilities" in values:
             values["capabilities_json"] = json.dumps(sorted(set(values.pop("capabilities"))), ensure_ascii=False)
+        if "served_populations" in values:
+            values["served_populations_json"] = json.dumps(sorted(set(values.pop("served_populations") or [])), ensure_ascii=False)
+        if "supported_risk_levels" in values:
+            values["supported_risk_levels_json"] = json.dumps(sorted(set(values.pop("supported_risk_levels") or [])), ensure_ascii=False)
+        if "open_windows" in values:
+            values["open_windows_json"] = json.dumps(values.pop("open_windows") or [], ensure_ascii=False, sort_keys=True)
         assignments = [f"{key}=?" for key in values]
         self.connection.execute(
             f"UPDATE pilot_sites SET {','.join(assignments)},updated_at=? WHERE id=?",

@@ -47,6 +47,9 @@ class MaintenanceService:
         "pilot_sessions",
         "pilot_observations",
         "pilot_interventions",
+        "pilot_matchings",
+        "pilot_matching_events",
+        "pilot_matching_notifications",
     )
 
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:

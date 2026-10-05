@@ -5,6 +5,25 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+RISK_LEVELS = ("low", "medium", "high")
+ETHICS_LEVELS = ("none", "basic", "full")
+
+
+class OpenWindow(BaseModel):
+    starts_at: str = Field(min_length=10, max_length=40)
+    ends_at: str = Field(min_length=10, max_length=40)
+    note: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "OpenWindow":
+        from app.core.clock import from_storage
+        start = from_storage(self.starts_at)
+        end = from_storage(self.ends_at)
+        if start is None or end is None or end <= start:
+            raise ValueError("开放时间窗的结束时间必须晚于开始时间")
+        return self
+
+
 class ProductCreate(BaseModel):
     code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
     name: str = Field(min_length=2, max_length=160)
@@ -12,6 +31,7 @@ class ProductCreate(BaseModel):
     origin_country: str = Field(min_length=2, max_length=80)
     category: Literal["康复设备", "辅助诊断", "数字疗法", "慢病管理", "数字中医", "健康消费"]
     intended_use: str = Field(min_length=10, max_length=2000)
+    intended_populations: list[str] = Field(default_factory=list, max_length=50)
     risk_level: Literal["low", "medium", "high"]
     regulatory_status: Literal["展示", "研究", "已注册", "暂停"] = "展示"
 
@@ -19,6 +39,7 @@ class ProductCreate(BaseModel):
 class ProductUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     intended_use: str | None = Field(default=None, min_length=10, max_length=2000)
+    intended_populations: list[str] | None = Field(default=None, max_length=50)
     risk_level: Literal["low", "medium", "high"] | None = None
     regulatory_status: Literal["展示", "研究", "已注册", "暂停"] | None = None
     active: bool | None = None
@@ -30,14 +51,22 @@ class SiteCreate(BaseModel):
     site_type: Literal["展会体验点", "医院", "康复机构", "研究机构", "产业伙伴"]
     region: str = Field(min_length=2, max_length=120)
     capabilities: list[str] = Field(default_factory=list, max_length=100)
+    served_populations: list[str] = Field(default_factory=list, max_length=50)
     max_concurrent: int = Field(default=1, ge=1, le=10000)
+    ethics_prepared_level: Literal["none", "basic", "full"] = "none"
+    supported_risk_levels: list[Literal["low", "medium", "high"]] = Field(default_factory=lambda: list(RISK_LEVELS), min_length=1)
+    open_windows: list[OpenWindow] = Field(default_factory=list, max_length=50)
 
 
 class SiteUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     region: str | None = Field(default=None, min_length=2, max_length=120)
     capabilities: list[str] | None = Field(default=None, max_length=100)
+    served_populations: list[str] | None = Field(default=None, max_length=50)
     max_concurrent: int | None = Field(default=None, ge=1, le=10000)
+    ethics_prepared_level: Literal["none", "basic", "full"] | None = None
+    supported_risk_levels: list[Literal["low", "medium", "high"]] | None = Field(default=None, min_length=1)
+    open_windows: list[OpenWindow] | None = Field(default=None, max_length=50)
     status: Literal["active", "suspended", "closed"] | None = None
 
 

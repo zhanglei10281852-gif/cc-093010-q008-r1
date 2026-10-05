@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS health_products (
     origin_country TEXT NOT NULL,
     category TEXT NOT NULL CHECK(category IN ('康复设备','辅助诊断','数字疗法','慢病管理','数字中医','健康消费')),
     intended_use TEXT NOT NULL,
+    intended_populations_json TEXT NOT NULL DEFAULT '[]',
     risk_level TEXT NOT NULL CHECK(risk_level IN ('low','medium','high')),
     regulatory_status TEXT NOT NULL DEFAULT '展示' CHECK(regulatory_status IN ('展示','研究','已注册','暂停')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
@@ -153,7 +154,11 @@ CREATE TABLE IF NOT EXISTS pilot_sites (
     site_type TEXT NOT NULL CHECK(site_type IN ('展会体验点','医院','康复机构','研究机构','产业伙伴')),
     region TEXT NOT NULL,
     capabilities_json TEXT NOT NULL DEFAULT '[]',
+    served_populations_json TEXT NOT NULL DEFAULT '[]',
     max_concurrent INTEGER NOT NULL DEFAULT 1 CHECK(max_concurrent > 0),
+    ethics_prepared_level TEXT NOT NULL DEFAULT 'none' CHECK(ethics_prepared_level IN ('none','basic','full')),
+    supported_risk_levels_json TEXT NOT NULL DEFAULT '["low","medium","high"]',
+    open_windows_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended','closed')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -266,6 +271,66 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS pilot_matchings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matching_code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE RESTRICT,
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id) ON DELETE RESTRICT,
+    slot_quantity INTEGER NOT NULL DEFAULT 1 CHECK(slot_quantity > 0),
+    status TEXT NOT NULL DEFAULT 'reserved' CHECK(status IN (
+        'reserved','hospital_accepted','hospital_conditional','hospital_rejected',
+        'confirmed','enterprise_declined','expired','revoked'
+    )),
+    requested_by TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    hospital_contact TEXT NOT NULL DEFAULT '',
+    enterprise_contact TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    hospital_responded_at TEXT NOT NULL DEFAULT '',
+    hospital_condition TEXT NOT NULL DEFAULT '',
+    enterprise_responded_at TEXT NOT NULL DEFAULT '',
+    confirmed_at TEXT NOT NULL DEFAULT '',
+    released_at TEXT NOT NULL DEFAULT '',
+    release_reason TEXT NOT NULL DEFAULT '',
+    last_actor TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matchings_status ON pilot_matchings(status,expires_at);
+CREATE INDEX IF NOT EXISTS idx_matchings_site ON pilot_matchings(site_id,status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_matchings_idempotency
+    ON pilot_matchings(requested_by, idempotency_key) WHERE idempotency_key<>'';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_matchings_one_active_pair
+    ON pilot_matchings(product_id,site_id)
+    WHERE status IN ('reserved','hospital_accepted','hospital_conditional');
+CREATE TABLE IF NOT EXISTS pilot_matching_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matching_id INTEGER NOT NULL REFERENCES pilot_matchings(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(matching_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_matching_events_time ON pilot_matching_events(created_at,id);
+CREATE TABLE IF NOT EXISTS pilot_matching_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matching_id INTEGER NOT NULL REFERENCES pilot_matchings(id) ON DELETE CASCADE,
+    recipient_role TEXT NOT NULL CHECK(recipient_role IN ('hospital','enterprise','operator')),
+    event_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    delivered_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matching_notifications_pending
+    ON pilot_matching_notifications(recipient_role, delivered_at, id);
 '''
 
 
@@ -280,6 +345,8 @@ PERMISSIONS = [
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
+    ("matching.read", "查看试点名额匹配", "matching", "read"),
+    ("matching.write", "运营试点名额匹配", "matching", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
@@ -330,11 +397,35 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_columns(connection: sqlite3.Connection) -> None:
+    """对已存在的旧版数据库补齐新增列；全新数据库的建表语句已包含这些列。"""
+    product_columns = {
+        "intended_populations_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for name, declaration in product_columns.items():
+        if name not in _column_names(connection, "health_products"):
+            connection.execute(f"ALTER TABLE health_products ADD COLUMN {name} {declaration}")
+    site_columns = {
+        "served_populations_json": "TEXT NOT NULL DEFAULT '[]'",
+        "ethics_prepared_level": "TEXT NOT NULL DEFAULT 'none'",
+        "supported_risk_levels_json": "TEXT NOT NULL DEFAULT '[\"low\",\"medium\",\"high\"]'",
+        "open_windows_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for name, declaration in site_columns.items():
+        if name not in _column_names(connection, "pilot_sites"):
+            connection.execute(f"ALTER TABLE pilot_sites ADD COLUMN {name} {declaration}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_columns(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -355,6 +446,12 @@ def init_db() -> None:
         connection.execute(
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
+        )
+        operator = connection.execute("SELECT id FROM roles WHERE code='operator'").fetchone()[0]
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions "
+            "WHERE code IN ('catalog.read','catalog.write','evidence.review','feedback.read','matching.read','matching.write','jobs.run')",
+            (operator, now),
         )
 
 
