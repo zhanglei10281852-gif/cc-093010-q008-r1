@@ -266,6 +266,107 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS product_eligibility_profiles (
+    product_id INTEGER PRIMARY KEY REFERENCES health_products(id) ON DELETE CASCADE,
+    eligible_populations_json TEXT NOT NULL DEFAULT '[]',
+    excluded_populations_json TEXT NOT NULL DEFAULT '[]',
+    required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    allowed_regions_json TEXT NOT NULL DEFAULT '[]',
+    ethics_review_status TEXT NOT NULL DEFAULT '未提交' CHECK(ethics_review_status IN ('未提交','审查中','已通过','未通过')),
+    ethics_approved_at TEXT,
+    ethics_committee TEXT NOT NULL DEFAULT '',
+    open_from TEXT,
+    open_until TEXT,
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS site_departments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id) ON DELETE CASCADE,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    max_risk_level TEXT NOT NULL DEFAULT 'low' CHECK(max_risk_level IN ('low','medium','high')),
+    ethics_ready INTEGER NOT NULL DEFAULT 0 CHECK(ethics_ready IN (0,1)),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(site_id, code)
+);
+CREATE TABLE IF NOT EXISTS matching_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_code TEXT NOT NULL,
+    product_id INTEGER NOT NULL REFERENCES health_products(id),
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id),
+    department_id INTEGER REFERENCES site_departments(id),
+    rank INTEGER NOT NULL,
+    score REAL NOT NULL,
+    eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
+    reasons_json TEXT NOT NULL,
+    blockers_json TEXT NOT NULL DEFAULT '[]',
+    requested_region TEXT NOT NULL DEFAULT '',
+    requested_population TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reco_batch ON matching_recommendations(batch_code,rank);
+CREATE TABLE IF NOT EXISTS capacity_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id),
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id),
+    department_id INTEGER REFERENCES site_departments(id),
+    recommendation_id INTEGER REFERENCES matching_recommendations(id) ON DELETE SET NULL,
+    requested_by TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','conditional','accepted','rejected','confirmed','expired','cancelled')),
+    quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity > 0),
+    conditions_json TEXT NOT NULL DEFAULT '[]',
+    hospital_responded_by TEXT NOT NULL DEFAULT '',
+    hospital_responded_at TEXT,
+    enterprise_confirmed_by TEXT NOT NULL DEFAULT '',
+    enterprise_confirmed_at TEXT,
+    idempotency_key TEXT NOT NULL,
+    hospital_due_at TEXT NOT NULL,
+    enterprise_due_at TEXT,
+    enterprise_confirm_seconds INTEGER NOT NULL DEFAULT 43200,
+    released_at TEXT,
+    release_reason TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_site_status ON capacity_reservations(site_id,status);
+CREATE INDEX IF NOT EXISTS idx_reservations_due ON capacity_reservations(status,hospital_due_at,enterprise_due_at);
+CREATE TABLE IF NOT EXISTS capacity_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id),
+    reservation_id INTEGER REFERENCES capacity_reservations(id),
+    product_id INTEGER REFERENCES health_products(id),
+    event_type TEXT NOT NULL CHECK(event_type IN ('recommended','reserved','hospital_accepted','hospital_conditional','hospital_rejected','enterprise_confirmed','expired','cancelled')),
+    held_delta INTEGER NOT NULL DEFAULT 0,
+    confirmed_delta INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capacity_ledger_window ON capacity_ledger(site_id,created_at,id);
+CREATE TABLE IF NOT EXISTS matching_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL REFERENCES capacity_reservations(id) ON DELETE CASCADE,
+    recipient_role TEXT NOT NULL CHECK(recipient_role IN ('operator','hospital','enterprise')),
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    read_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_recipient ON matching_messages(recipient_role,recipient,read_at);
 '''
 
 
@@ -280,6 +381,8 @@ PERMISSIONS = [
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
+    ("matching.read", "查看匹配推荐与容量预留", "matching", "read"),
+    ("matching.operate", "运营匹配预留流程", "matching", "operate"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
@@ -334,7 +437,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
